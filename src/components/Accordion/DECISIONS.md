@@ -1,0 +1,5 @@
+- Headless: no default styles, users bring their own classes
+- Compound components (Accordion.Trigger, Accordion.Panel) instead of props
+- children as the label
+- type="single" | "multiple" on Accordion
+- Known gap: defaultOpen is ignored in single mode
