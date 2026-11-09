@@ -1,5 +1,5 @@
 {
-  "name": "Dolby2001Components",
+  "name": "@dolby2001/accessible-accordion",
   "version": "0.1.0",
   "type": "module",
   "files": ["dist"],
