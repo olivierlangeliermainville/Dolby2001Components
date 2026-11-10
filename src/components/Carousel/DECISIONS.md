@@ -1,0 +1,17 @@
+- Carousel: no GSAP or animation library
+- Carousel moved from scroll-snap to a state-driven design, because spam clicks were not smooth
+- One position value drives everything, and each slide calculates its own offset
+- Carousel modes: default (stops at the ends) and infinite (loops)
+- Infinite mode repeats slides when there are not enough to fill the track
+- Copies are aria-hidden and inert, and labels count only real slides
+- Motion is a spring driven by requestAnimationFrame, not a CSS transition
+- Slides always land on a whole slide, flush at the start
+- The spring never overshoots, so it does not go back and forth
+- Button clicks build on the target position, so fast clicking adds up
+- Drag uses pointer events and is measured in slides, so looping happens live
+- Velocity comes from the last 100ms of pointer movement
+- Drag settings are grouped under one drag prop
+- Reduced motion follows the system setting, with a reducedMotion prop to override it
+- Known limitation: inert as a prop needs React 19
+- Known limitation: slides must be the same width and direct children of Carousel.Track
+- Known limitation: ids inside infinite carousel slides get duplicated
