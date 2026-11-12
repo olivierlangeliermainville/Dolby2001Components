@@ -25,11 +25,11 @@ createRoot(document.getElementById('root')!).render(
       </Accordion>
     </div>
     <div className="p-4 w-full">
-      <Carousel type="infinite" gap={16} duration={400} drag={{ momentum: true, friction: 1.5 }} aria-label="Featured">
+      <Carousel type="infinite" autoPlay={{ speed: 0.5, playPauseEasingDuration: 2000, releaseEasingDuration:3000, pauseOnHover:false, pauseOnFocus:false, }} gap={16} duration={400} drag={{ momentum: true, friction: 1.0 }} aria-label="Featured">
           <Carousel.Track className="w-full max-w-3xl">
-              <Carousel.Slide className="w-64">One</Carousel.Slide>
-              <Carousel.Slide className="w-64">Two</Carousel.Slide>
-              <Carousel.Slide className="w-64">Three</Carousel.Slide>
+              <Carousel.Slide className="w-64"><button>One</button></Carousel.Slide>
+              <Carousel.Slide className="w-64"><button>Two</button></Carousel.Slide>
+              <Carousel.Slide className="w-64"><button>Three</button></Carousel.Slide>
           </Carousel.Track>
           <Carousel.Prev>←</Carousel.Prev>
           <Carousel.Next>→</Carousel.Next>

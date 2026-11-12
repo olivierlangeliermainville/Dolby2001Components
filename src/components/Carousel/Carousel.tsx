@@ -1,82 +1,18 @@
 "use client"
 import {
-    createContext,
     useContext,
     useEffect,
     useLayoutEffect,
     useRef,
     useState,
-    useSyncExternalStore,
     Children,
     isValidElement,
 } from 'react'
+import type { CarouselProps, DragOptions, AutoPlayOptions, ButtonProps } from './types'
+import { defaultLabels, SETTLE } from './defaults'
+import { visuallyHidden, useSystemReducedMotion, clamp, mod } from './helpers'
+import { useCarousel, CarouselContext, SlideContext } from './context'
 
-type CarouselType = 'default' | 'infinite'
-
-const SETTLE = 5.8 // omega × seconds for a critically damped spring to settle
-
-type DragOptions = {
-    momentum?: boolean     // flicks carry across several slides (default false)
-    reach?: number         // seconds of extra travel a flick adds (default 0.25)
-    maxSlides?: number     // most slides one flick can add (default 8)
-    friction?: number      // above 0. Higher stops sooner, lower glides longer (default 1)
-    duration?: number      // ms: settle time when there is no flick (defaults to `duration`)
-    minDuration?: number   // ms: shortest flick settle (default 0)
-    maxDuration?: number   // ms: longest flick settle (default 10000)
-}
-
-type CarouselContextValue = {
-    position: number     // settled slide (whole number): where it is heading
-    livePosition: number // animated position (fractional): where it is drawn
-    active: number       // position wrapped into 0..count-1
-    count: number        // real slides only
-    visible: number      // how many whole slides fit in the track
-    gap: number          // px
-    type: CarouselType
-    canPrev: boolean
-    canNext: boolean
-    draggable: boolean
-    dragging: boolean
-    setCount: (n: number) => void
-    setVisible: (n: number) => void
-    go: (direction: 1 | -1) => void
-    goBy: (steps: number) => void
-    startDrag: () => void
-    moveDrag: (slides: number) => void      // distance dragged, in slides (right = positive)
-    releaseDrag: (velocity: number) => void // slides per second, forward = positive
-}
-
-const CarouselContext = createContext<CarouselContextValue | null>(null)
-
-function useCarousel() {
-    const context = useContext(CarouselContext)
-    if (!context) throw new Error('Carousel parts must be used inside <Carousel>')
-    return context
-}
-
-// Reads the system "reduce motion" setting. Assumes "no preference" on the server.
-function useSystemReducedMotion() {
-    return useSyncExternalStore(
-        (callback) => {
-            const query = window.matchMedia('(prefers-reduced-motion: reduce)')
-            query.addEventListener('change', callback)
-            return () => query.removeEventListener('change', callback)
-        },
-        () => window.matchMedia('(prefers-reduced-motion: reduce)').matches,
-        () => false
-    )
-}
-
-const mod = (n: number, m: number) => ((n % m) + m) % m
-const clamp = (n: number, min: number, max: number) => Math.min(Math.max(n, min), max)
-
-type CarouselProps = React.ComponentPropsWithoutRef<'section'> & {
-    type?: CarouselType
-    gap?: number             // px between slides
-    duration?: number        // ms: how long Prev and Next take to settle
-    reducedMotion?: boolean  // omit to follow the system setting
-    drag?: boolean | DragOptions
-}
 
 export default function Carousel({
     children,
@@ -85,19 +21,34 @@ export default function Carousel({
     duration = 300,
     reducedMotion,
     drag = false,
+    autoPlay = false,
+    labels: labelOverrides,
     ...props
 }: CarouselProps) {
     // --- Options --------------------------------------------------------------------
 
-    const dragOptions = typeof drag === 'object' ? drag : {}
     const draggable = drag !== false
-    const momentum = dragOptions.momentum ?? false
-    const reach = dragOptions.reach ?? 0.25
-    const maxSlides = dragOptions.maxSlides ?? 8
-    const friction = Math.max(dragOptions.friction ?? 1, 0.01)
-    const releaseDuration = dragOptions.duration ?? duration
-    const minDuration = dragOptions.minDuration ?? 0
-    const maxDuration = dragOptions.maxDuration ?? 10000
+    const {
+        momentum = false,
+        reach = 0.25,
+        maxSlides = 8,
+        friction = 1,
+        duration: releaseDuration = duration,
+        minDuration = 0,
+        maxDuration = 10000,
+    }: DragOptions = typeof drag === 'object' ? drag : {}
+    const {
+        interval = 5000,
+        speed,
+        playPauseEasingDuration = 0,
+        releaseEasingDuration = playPauseEasingDuration,
+        pauseOnHover = true,
+        pauseOnFocus = true,
+        playPauseButton=true,
+        releaseEasing = (t: number) => t,
+        playPauseEasing = (t: number) => t,
+    }: AutoPlayOptions = typeof autoPlay === 'object' ? autoPlay : {}
+    const labels = { ...defaultLabels, ...labelOverrides }
 
     // --- State ----------------------------------------------------------------------
 
@@ -106,6 +57,10 @@ export default function Carousel({
     const [count, setCount] = useState(0)
     const [visible, setVisible] = useState(1)
     const [dragging, setDragging] = useState(false)
+    const [moved, setMoved] = useState(false) // false until the first move: nothing is announced on load
+    const [playing, setPlaying] = useState(true)  // the user's choice: the play/pause button, or keyboard focus
+    const [hovered, setHovered] = useState(false) // a temporary pause: autoplay resumes when the pointer leaves
+
     const systemReduced = useSystemReducedMotion()
     const reduced = reducedMotion ?? systemReduced
 
@@ -119,12 +74,25 @@ export default function Carousel({
 
     const infinite = type === 'infinite' && count > 1
     // Infinite mode can always move (the track adds copies as needed); default mode only if slides overflow
-    const scrollable = infinite ? true : count > visible
+    const scrollable = infinite || count > visible
     const maxPosition = Math.max(0, count - visible)
 
     // In default mode the last slide stops at the right edge; resizing can't leave us past it
     const position = infinite ? settled : Math.min(settled, maxPosition)
     const livePosition = infinite ? live : clamp(live, 0, maxPosition)
+
+    const easings = useRef({ playPause: playPauseEasing, release: releaseEasing })
+    useLayoutEffect(() => {
+        easings.current = { playPause: playPauseEasing, release: releaseEasing }
+    })
+
+    // Autoplay is derived in three levels, each stricter than the last, never stored:
+    // autoPlayOn: autoplay is switched on and allowed to move.
+    // canRun:     ...and nobody is dragging (a drag takes over at once, with no easing).
+    // running:    ...and no soft pause (button, keyboard focus, hover), which glide mode eases into.
+    const autoPlayOn = !!autoPlay && infinite && !reduced
+    const canRun = autoPlayOn && !dragging
+    const running = canRun && playing && !hovered
 
     useEffect(
         () => () => {
@@ -148,6 +116,7 @@ export default function Carousel({
         stop()
         targetRef.current = target
         setSettled(target)
+        setMoved(true)
 
         if (reduced || ms <= 0) {
             liveRef.current = target
@@ -191,14 +160,109 @@ export default function Carousel({
         frameRef.current = requestAnimationFrame(tick)
     }
 
-    // Builds on the target we are heading to, so clicking fast adds up
+    // Builds on the target we are heading to, so clicking fast adds up.
+    // The Prev/Next buttons already refuse to call this when they can't move.
     const goBy = (steps: number) => {
-        if (!scrollable || steps === 0) return
         const base = infinite ? targetRef.current : Math.min(targetRef.current, maxPosition)
-        const target = infinite ? base + steps : clamp(base + steps, 0, maxPosition)
-        animateTo(target, velocityRef.current)
+        animateTo(infinite ? base + steps : clamp(base + steps, 0, maxPosition), velocityRef.current)
     }
-    const go = (direction: 1 | -1) => goBy(direction)
+
+    // --- Autoplay -------------------------------------------------------------------
+
+    // goBy is recreated on every render (and the carousel renders every animation frame), so the
+    // timer reads the latest one through a ref instead of restarting itself whenever it changes
+    const goByRef = useRef(goBy)
+    useLayoutEffect(() => {
+        goByRef.current = goBy
+    })
+
+    // Step mode: wait `interval` ms, then move one slide with a spring.
+    // `settled` is a dependency, so any move (including a manual one) restarts the wait.
+    useEffect(() => {
+        if (!running || speed) return
+
+        let frame = 0
+        let last = performance.now()
+        let elapsed = 0 // ms since the last step
+
+        const tick = (now: number) => {
+            // Capped, so coming back to a hidden tab doesn't trigger a jump
+            elapsed += Math.min(now - last, 50)
+            last = now
+
+            if (elapsed >= interval) {
+                elapsed = 0
+                goByRef.current(1)
+            }
+            frame = requestAnimationFrame(tick)
+        }
+
+        frame = requestAnimationFrame(tick)
+        return () => cancelAnimationFrame(frame)
+    }, [running, interval, speed, settled])
+
+    // Glide mode: move a little every frame at `glideVelocity` (slides per second).
+    // Every time the goal changes (resume, pause, drag release) the effect restarts and eases the
+    // velocity from wherever it is now to the new goal: `speed` while running, 0 while paused.
+    // The velocity lives in a ref, so it survives the restart.
+    const glideVelocity = useRef(0)
+    const afterRelease = useRef(false) // set by a drag release, so its ease can be slower
+
+    useEffect(() => {
+        if (!speed || !canRun) {
+            glideVelocity.current = 0 // not gliding, or a drag has taken over
+            return
+        }
+        const goal = running ? speed : 0
+        const ease = afterRelease.current
+            ? { duration: releaseEasingDuration, easing: easings.current.release }
+            : { duration: playPauseEasingDuration, easing: easings.current.playPause }
+        afterRelease.current = false
+        if (goal === 0 && glideVelocity.current === 0) return // already still: nothing to run
+
+        let from = glideVelocity.current // where the ease starts: rest, a flick, or mid-ease
+        let eased = 0                    // ms into the ease
+        let frame = 0
+        let last = performance.now()
+
+        const tick = (now: number) => {
+            // Capped, so coming back to a hidden tab doesn't trigger a jump
+            const dt = Math.min(now - last, 50)
+            last = now
+
+            if (frameRef.current !== null) {
+                // A spring is settling (a Prev/Next press, or a drag release that didn't hand over).
+                // It owns the position and ends at rest, so the ease starts over from zero after it.
+                glideVelocity.current = 0
+                from = 0
+                eased = 0
+            } else {
+                // Ease-in-out (smoothstep): the velocity starts changing gently, speeds up the change,
+                // then settles into the goal. Zero duration means no easing.
+                eased += dt
+                const p = ease.duration > 0 ? Math.min(eased / ease.duration, 1) : 1
+                glideVelocity.current = p >= 1 ? goal : from + (goal - from) * ease.easing(p)
+                if (p<1){
+                    console.log(glideVelocity.current)
+                }
+
+                if (glideVelocity.current !== 0) {
+                    liveRef.current += (glideVelocity.current * dt) / 1000
+                    const slide = Math.round(liveRef.current)
+                    targetRef.current = slide // so a later Prev/Next builds on where we are
+                    setSettled(slide)         // drives which slides screen readers can reach
+                    setLive(liveRef.current)
+                }
+            }
+
+            // Eased all the way to a stop: no more frames until it is resumed
+            if (goal === 0 && glideVelocity.current === 0) return
+            frame = requestAnimationFrame(tick)
+        }
+
+        frame = requestAnimationFrame(tick)
+        return () => cancelAnimationFrame(frame)
+    }, [running, canRun, speed, playPauseEasingDuration, releaseEasingDuration])
 
     // --- Drag -----------------------------------------------------------------------
 
@@ -229,8 +293,20 @@ export default function Carousel({
         }
 
         const v = momentum ? velocity : 0
+
+        // Glide mode: a release aims for `speed`, not for a stop. Skip the snap-to-a-slide spring and
+        // carry the release velocity into the glide, which eases from it to `speed`. A mouse is still
+        // over the carousel at this point, so clear the hover pause too (the next time the pointer
+        // enters, it applies again). Only a deliberate pause (button or keyboard focus) is respected.
+        if (speed && autoPlayOn && playing) {
+            glideVelocity.current = v
+            afterRelease.current = true
+            setHovered(false)
+            return
+        }
+
         const startSlide = Math.round(dragBase.current)
-        const moved = liveRef.current - dragBase.current
+        const dragged = liveRef.current - dragBase.current
         const flick = clamp(v * reach, -maxSlides, maxSlides)
 
         let target = Math.round(liveRef.current + flick)
@@ -239,18 +315,18 @@ export default function Carousel({
         // A flick wins over the drag direction when both exist.
         if (target === startSlide) {
             if (Math.abs(flick) > 0.1) target = startSlide + Math.sign(flick)
-            else if (Math.abs(moved) > 0.2) target = startSlide + Math.sign(moved)
+            else if (Math.abs(dragged) > 0.2) target = startSlide + Math.sign(dragged)
         }
         if (!infinite) target = clamp(target, 0, maxPosition)
 
         // A flick sets its own duration: the spring settles at the speed you threw it
         const distance = Math.abs(target - liveRef.current)
-        const speed = Math.abs(v)
+        const flickSpeed = Math.abs(v)
         const movingToward = Math.sign(target - liveRef.current) === Math.sign(v)
 
         let ms = releaseDuration
-        if (momentum && movingToward && speed > 0.5 && distance > 0) {
-            const natural = (SETTLE * distance * 1000) / speed / friction
+        if (momentum && movingToward && flickSpeed > 0.5 && distance > 0) {
+            const natural = (SETTLE * distance * 1000) / flickSpeed / Math.max(friction, 0.01)
             ms = clamp(natural, minDuration, maxDuration)
         }
 
@@ -259,47 +335,67 @@ export default function Carousel({
 
     // --- Derived values -------------------------------------------------------------
 
-    const active = count > 0 ? mod(position, count) : 0
-    const canPrev = scrollable && (infinite || position > 0)
-    const canNext = scrollable && (infinite || position < maxPosition)
+    // Announced after Prev, Next or a drag, since focus stays on the button. It reads the settled
+    // position, so it speaks once per move rather than on every animation frame. It stays silent
+    // while autoplay is running, or a screen reader would read out a new slide every few seconds.
+    const first = (count > 0 ? mod(position, count) : 0) + 1
+    const last = visible >= count ? first : mod(position + visible - 1, count) + 1
+    const status = moved && !dragging && !running ? labels.status(first, last, count) : ''
 
     return (
         <CarouselContext.Provider
             value={{
                 position,
                 livePosition,
-                active,
-                count,
                 visible,
                 gap,
                 type,
-                canPrev,
-                canNext,
+                labels,
+                canPrev: scrollable && (infinite || position > 0),
+                canNext: scrollable && (infinite || position < maxPosition),
                 draggable: draggable && scrollable,
                 dragging,
+                autoPlayable: !!autoPlay,
+                playing,
+                playPauseButton,
+                setPlaying,
                 setCount,
                 setVisible,
-                go,
                 goBy,
                 startDrag,
                 moveDrag,
                 releaseDrag,
             }}
         >
-            <section aria-roledescription="carousel" {...props}>
+            <section
+                aria-roledescription="carousel"
+                {...props}
+                // Your own handlers still run: these wrap them instead of replacing them
+                onPointerEnter={(event) => {
+                    props.onPointerEnter?.(event)
+                    // Mouse only: a touch has no "leave", so it would leave autoplay stuck on pause
+                    if (pauseOnHover && event.pointerType === 'mouse') setHovered(true)
+                }}
+                onPointerLeave={(event) => {
+                    props.onPointerLeave?.(event)
+                    setHovered(false)
+                }}
+                onFocus={(event) => {
+                    props.onFocus?.(event)
+                    // Keyboard focus stops rotation until the user presses play (not on mouse clicks,
+                    // or clicking the pause button would pause, then un-pause itself)
+                    if (pauseOnFocus && event.target.matches(':focus-visible')) setPlaying(false)
+                }}
+            >
                 {children}
+                <div role="status" aria-atomic="true" style={visuallyHidden}>
+                    {status}
+                </div>
             </section>
         </CarouselContext.Provider>
     )
 }
 
-const SlideContext = createContext({
-    index: 0,       // position in the ring (real slides + copies)
-    total: 0,       // ring size
-    realIndex: 0,   // index among your real slides
-    realCount: 0,
-    isClone: false,
-})
 
 export function CarouselTrack({ children, style, ...props }: React.ComponentPropsWithoutRef<'div'>) {
     const {
@@ -307,6 +403,7 @@ export function CarouselTrack({ children, style, ...props }: React.ComponentProp
         setVisible,
         gap,
         type,
+        position,
         visible,
         draggable,
         dragging,
@@ -337,6 +434,16 @@ export function CarouselTrack({ children, style, ...props }: React.ComponentProp
         realIndex: index % n,
         isClone: index >= n,
     }))
+
+    // Slides are placed with transforms, so screen readers and Tab follow the DOM order, not the
+    // drawn order. The visible slides are consecutive around the ring, but the DOM is a line, so
+    // they would be read out of order when they wrap past its end. Start the list at a "seam"
+    // that moves in blocks, so the visible slides always sit in one run (the ring always has at
+    // least visible + 3 slides, so a block is at least 4 and the list reorders only occasionally).
+    const total = ring.length
+    const block = total - visible + 1
+    const seam = infinite ? mod(Math.floor(position / block) * block, total) : 0
+    const ordered = [...ring.slice(seam), ...ring.slice(0, seam)]
 
     useLayoutEffect(() => {
         setCount(n)
@@ -424,26 +531,29 @@ export function CarouselTrack({ children, style, ...props }: React.ComponentProp
         releaseDrag((-getVelocity(event.timeStamp) * 1000) / stepPx.current)
     }
 
+    const dragProps = draggable
+        ? {
+              onPointerDown,
+              onPointerMove,
+              onPointerUp: onPointerEnd,
+              onPointerCancel: onPointerEnd,
+              // swallow the click that follows a drag
+              onClickCapture: (event: React.MouseEvent) => {
+                  if (justDragged.current) {
+                      event.preventDefault()
+                      event.stopPropagation()
+                  }
+              },
+          }
+        : {}
+
     return (
         // overflow hidden clips off-screen slides; grid keeps the height of the tallest slide
         <div
             {...props}
             ref={trackRef}
             data-dragging={dragging ? '' : undefined}
-            onPointerDown={draggable ? onPointerDown : undefined}
-            onPointerMove={draggable ? onPointerMove : undefined}
-            onPointerUp={draggable ? onPointerEnd : undefined}
-            onPointerCancel={draggable ? onPointerEnd : undefined}
-            onClickCapture={
-                draggable
-                    ? (event) => {
-                          if (justDragged.current) {
-                              event.preventDefault()
-                              event.stopPropagation()
-                          }
-                      }
-                    : undefined
-            }
+            {...dragProps}
             style={{
                 display: 'grid',
                 overflow: 'hidden',
@@ -451,10 +561,10 @@ export function CarouselTrack({ children, style, ...props }: React.ComponentProp
                 ...style,
             }}
         >
-            {ring.map(({ slide, index, realIndex, isClone }) => (
+            {ordered.map(({ slide, index, realIndex, isClone }) => (
                 <SlideContext.Provider
                     key={`${slide.key ?? realIndex}-${isClone ? index : 'real'}`}
-                    value={{ index, total: ring.length, realIndex, realCount: n, isClone }}
+                    value={{ index, total, realIndex, realCount: n, isClone }}
                 >
                     {slide}
                 </SlideContext.Provider>
@@ -464,7 +574,7 @@ export function CarouselTrack({ children, style, ...props }: React.ComponentProp
 }
 
 export function CarouselSlide({ children, style, ...props }: React.ComponentPropsWithoutRef<'div'>) {
-    const { position, livePosition, visible, gap, type } = useCarousel()
+    const { position, livePosition, visible, gap, type, labels } = useCarousel()
     const { index, total, realIndex, realCount, isClone } = useContext(SlideContext)
 
     // Window of [-1, total - 2]: one slide waits on the left, the rest line up to the right.
@@ -476,18 +586,22 @@ export function CarouselSlide({ children, style, ...props }: React.ComponentProp
     const offset = wrap(index - livePosition) // where it is drawn: follows the animation
     const restOffset = wrap(index - position) // where it settles: used for accessibility
 
-    // Copies are never exposed to screen readers or the keyboard.
-    // Uses the settled position, so aria attributes don't flicker mid-animation.
-    const inWindow = restOffset >= 0 && restOffset < visible
-    const isVisible = inWindow && (!isClone || realCount >= visible)
+    // Only the slides on screen are exposed to screen readers and the keyboard, using the settled
+    // position so nothing flickers mid-animation. Copies are exposed only when the visible window
+    // lands on them instead of the originals, which keeps each real slide exposed at most once.
+    const isVisible = restOffset >= 0 && restOffset < visible && (!isClone || realCount >= visible)
 
     return (
         <div
+            // `inert` is set as a property because React 18 ignores the attribute and React 19
+            // treats it as a boolean. The property behaves the same in both.
+            ref={(el) => {
+                if (el) el.inert = !isVisible
+            }}
             role="group"
             aria-roledescription="slide"
-            aria-label={realCount > 0 ? `${realIndex + 1} of ${realCount}` : undefined}
-            aria-hidden={!isVisible}
-            inert={!isVisible}
+            aria-label={realCount > 0 ? labels.slide(realIndex + 1, realCount) : undefined}
+            aria-hidden={isVisible ? undefined : true}
             data-active={isVisible ? '' : undefined}
             data-carousel-clone={isClone ? '' : undefined}
             {...props}
@@ -506,40 +620,47 @@ export function CarouselSlide({ children, style, ...props }: React.ComponentProp
     )
 }
 
-type ButtonProps = React.ComponentPropsWithoutRef<'button'>
 
-export function CarouselPrev({ children, onClick, ...props }: ButtonProps) {
-    const { go, canPrev } = useCarousel()
+function CarouselButton({ direction, onClick, ...props }: ButtonProps & { direction: 1 | -1 }) {
+    const { goBy, canPrev, canNext, labels } = useCarousel()
+    const enabled = direction === 1 ? canNext : canPrev
     return (
         <button
-            aria-label="Previous slide"
-            disabled={!canPrev}
+            aria-label={direction === 1 ? labels.next : labels.prev}
+            aria-disabled={enabled ? undefined : true}
             {...props}
             type="button"
             onClick={(event) => {
+                if (!enabled) return
                 onClick?.(event)
-                go(-1)
+                goBy(direction)
             }}
-        >
-            {children}
-        </button>
+        />
     )
 }
 
-export function CarouselNext({ children, onClick, ...props }: ButtonProps) {
-    const { go, canNext } = useCarousel()
+export function CarouselPrev(props: ButtonProps) {
+    return <CarouselButton direction={-1} {...props} />
+}
+
+export function CarouselNext(props: ButtonProps) {
+    return <CarouselButton direction={1} {...props} />
+}
+
+// Place this first inside <Carousel>, before the slides, so it is first in the Tab order.
+// The label changes with what pressing it will do, so it carries no aria-pressed.
+export function CarouselPlayPause({ onClick, ...props }: ButtonProps) {
+    const { playing, setPlaying, autoPlayable, labels, playPauseButton } = useCarousel()
+    if (!autoPlayable && !playPauseButton) return null
     return (
         <button
-            aria-label="Next slide"
-            disabled={!canNext}
+            aria-label={playing ? labels.pause : labels.play}
             {...props}
             type="button"
             onClick={(event) => {
                 onClick?.(event)
-                go(1)
+                setPlaying(!playing)
             }}
-        >
-            {children}
-        </button>
+        />
     )
 }
